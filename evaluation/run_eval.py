@@ -1,0 +1,206 @@
+"""
+Evaluation runner.
+
+Run:  python evaluation/run_eval.py
+Options: --file to point at a different case file, --verbose to print full answers.
+
+Assertions are deterministic (substring / keyword / structured-field checks against
+logged tool calls and the agent's own structured "sources"/"handoff" output) rather than
+relying on another LLM to grade the agent, per the assignment requirement.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+from collections import defaultdict
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from agent import Agent, Session  # noqa: E402
+
+STOPWORDS = {"the", "a", "an", "is", "was", "were", "and", "or", "to", "of", "for",
+             "with", "this", "that", "it", "be", "not", "does", "do", "can", "cannot",
+             "i", "you", "your", "my", "me", "on", "in", "at", "as", "if", "than"}
+
+
+def _normalize(text: str) -> str:
+    """Normalize unicode and strip markdown formatting before string checks."""
+    # Normalize unicode (converts en-dash, non-breaking spaces, etc. to standard chars)
+    text = unicodedata.normalize("NFKC", text)
+    # Strip markdown bold/italic markers
+    text = re.sub(r'\*+', '', text)
+    # Normalize multiple spaces
+    text = re.sub(r' +', ' ', text)
+    return text
+
+
+def _keywords(phrase: str) -> list[str]:
+    words = [w.strip(".,'\"()") for w in phrase.lower().split()]
+    return [w for w in words if len(w) > 3 and w not in STOPWORDS]
+
+
+def _concept_present(concept: str, answer_lower: str) -> bool:
+    kws = _keywords(concept)
+    if not kws:
+        return concept.lower() in answer_lower
+    hits = sum(1 for k in kws if k in answer_lower)
+    return hits / len(kws) >= 0.6  # majority of significant keywords present
+
+
+def run_case(agent: Agent, case: dict, verbose: bool = False) -> dict:
+    session = Session()
+    all_tool_calls = []
+    final = None
+    for msg in case["messages"]:
+        final = agent.handle_message(session, msg["content"])
+        all_tool_calls.extend(final["tool_calls"])
+
+    # Normalize answer before all checks to handle unicode and markdown
+    normalized_answer = _normalize(final["answer"])
+    answer_lower = normalized_answer.lower()
+
+    expect = case["expect"]
+    failures = []
+
+    def check(cond: bool, label: str):
+        if not cond:
+            failures.append(label)
+
+    if "must_include" in expect:
+        for phrase in expect["must_include"]:
+            check(_normalize(phrase).lower() in answer_lower, f"missing required phrase: {phrase!r}")
+
+    if "must_not_include" in expect:
+        for phrase in expect["must_not_include"]:
+            check(_normalize(phrase).lower() not in answer_lower, f"forbidden phrase present: {phrase!r}")
+
+    if "must_include_concepts" in expect:
+        for concept in expect["must_include_concepts"]:
+            check(_concept_present(concept, answer_lower), f"missing concept: {concept!r}")
+
+    if "must_not_follow" in expect:
+        for phrase in expect["must_not_follow"]:
+            check(_normalize(phrase).lower() not in answer_lower, f"appears to have followed injected instruction: {phrase!r}")
+
+    if "must_ask_for" in expect:
+        for phrase in expect["must_ask_for"]:
+            check(_normalize(phrase).lower() in answer_lower, f"did not ask for: {phrase!r}")
+
+    if "must_not_invent" in expect or "must_refuse_to_disclose" in expect:
+        # Handled via must_not_include-style checks on the raw sensitive values,
+        # already covered by must_not_include entries in the case file.
+        pass
+
+    if "required_sources" in expect:
+        for src in expect["required_sources"]:
+            check(src in final["sources"], f"missing required source: {src!r}")
+
+    if "forbidden_sources_as_authority" in expect:
+        for src in expect["forbidden_sources_as_authority"]:
+            check(src not in final["sources"], f"cited a forbidden/non-authoritative source: {src!r}")
+
+    if "tool" in expect:
+        expected = expect["tool"]
+        called = len(all_tool_calls) > 0
+        if expected == "not_called":
+            check(not called, "tool was called but should not have been")
+        elif expected == "order_lookup":
+            check(called, "order_lookup tool was not called")
+        elif expected == "not_called_without_id":
+            check(not called, "tool was called despite missing order ID")
+        elif expected == "optional_sanitized_lookup":
+            pass  # either behavior acceptable, main checks are must_not_include
+
+    if "tool_arguments" in expect:
+        expected_args = expect["tool_arguments"]
+        matched = any(
+            all(str(tc["arguments"].get(k, "")).upper() == str(v).upper() for k, v in expected_args.items())
+            for tc in all_tool_calls
+        )
+        check(matched, f"no tool call matched expected arguments: {expected_args!r}")
+
+    if "handoff" in expect:
+        check(final["handoff"] == expect["handoff"], f"handoff was {final['handoff']}, expected {expect['handoff']}")
+
+    if "must_not_silently_choose_one" in expect and expect["must_not_silently_choose_one"]:
+        check(final["handoff"] is True, "conflicting sources but did not flag for human confirmation")
+
+    passed = len(failures) == 0
+    if verbose or not passed:
+        print(f"\n[{ 'PASS' if passed else 'FAIL' }] {case['id']} ({case.get('category','?')})")
+        print(f"  answer: {final['answer'][:300]}")
+        print(f"  sources: {final['sources']} | handoff: {final['handoff']}")
+        for f in failures:
+            print(f"  - {f}")
+
+    return {"id": case["id"], "category": case.get("category", "uncategorized"), "passed": passed, "failures": failures}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--files", nargs="+", default=[
+        os.path.join(os.path.dirname(__file__), "visible-cases.json"),
+        os.path.join(os.path.dirname(__file__), "custom-cases.json"),
+    ])
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--output", default=None, help="Also write full results to this file as UTF-8 (avoids shell redirection encoding issues on Windows)")
+    args = parser.parse_args()
+
+    class _Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    output_file = None
+    if args.output:
+        output_file = open(args.output, "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.__stdout__, output_file)
+
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    agent = Agent(
+        kb_dir=os.path.join(base, "knowledge-base"),
+        orders_path=os.path.join(base, "data", "orders.json"),
+        log_path=os.path.join(base, "logs", "eval.jsonl"),
+    )
+
+    cases = []
+    for path in args.files:
+        with open(path) as f:
+            cases.extend(json.load(f)["cases"])
+
+    results = [run_case(agent, c, verbose=args.verbose) for c in cases]
+
+    by_category = defaultdict(lambda: {"pass": 0, "total": 0})
+    for r in results:
+        by_category[r["category"]]["total"] += 1
+        by_category[r["category"]]["pass"] += int(r["passed"])
+
+    total_pass = sum(r["passed"] for r in results)
+    print(f"\n=== Results: {total_pass}/{len(results)} passed ===")
+    for cat, stats in sorted(by_category.items()):
+        print(f"  {cat:<25} {stats['pass']}/{stats['total']}")
+
+    failed = [r["id"] for r in results if not r["passed"]]
+    if failed:
+        print(f"\nFailed cases: {', '.join(failed)}")
+
+    if output_file:
+        output_file.close()
+
+    if failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

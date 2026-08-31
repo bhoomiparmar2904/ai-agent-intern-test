@@ -156,7 +156,7 @@ The demo video is included with the project submission as:
 
 `FINAL DEMOO.mp4`
 
-The demonstration covers the main reliability features of the agent, including:
+The demo video is available here:
 https://drive.google.com/file/d/1Eio1SoP30YYtEjAJiBWS5EoNMTCMbEpY/view?usp=sharing
 
 
